@@ -1,99 +1,86 @@
-import logging
-import math
-import re
-from datetime import datetime, timedelta
-import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from scipy.stats import norm
-import os
+import traceback
 
-# Black-Scholes formula for European options
-def black_scholes_price(S, K, T, r, sigma, option_type="call"):
-    if T <= 0 or sigma <= 0:
-        return max(0.0, S - K) if option_type == "call" else max(0.0, K - S)
+try:
+    import requests
+    import math
+    import datetime
+    import os
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 
-    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
+    # 获取环境变量
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-    if option_type == "call":
-        price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
-    else:
-        price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Hello! I'm your option bot.")
 
-    return round(price, 2)
-
-# Get current stock price from Yahoo Finance
-def get_stock_price(symbol):
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-    response = requests.get(url).json()
-    try:
-        return float(response["quoteResponse"]["result"][0]["regularMarketPrice"])
-    except:
-        return None
-
-# Parse user message
-def parse_message(text):
-    pattern = re.compile(
-        r"(\b[A-Z]+\b).*?(?:price\s*(\d+(?:\.\d+)?))?.*?(?:strike\s*(\d+(?:\.\d+)?)).*?(?:(?:exp(?:ire)?\s*(\d+)\s*(days?|weeks?|months?))|(?:exp\s*in\s*(\d+)\s*days?))?.*?(call|put)?",
-        re.IGNORECASE,
-    )
-    match = pattern.search(text)
-    if match:
-        symbol = match.group(1).upper()
-        price = float(match.group(2)) if match.group(2) else None
-        strike = float(match.group(3))
-        exp_num = match.group(4) or match.group(6)
-        exp_unit = (match.group(5) or "days").lower()
-        option_type = match.group(7).lower() if match.group(7) else "call"
-
-        if exp_num:
-            exp_num = int(exp_num)
-            if "week" in exp_unit:
-                days = exp_num * 7
-            elif "month" in exp_unit:
-                days = exp_num * 30
-            else:
-                days = exp_num
+    def get_option_price(underlying_price, strike_price, days_to_expiration, volatility, option_type="call"):
+        risk_free_rate = 0.01
+        d1 = (math.log(underlying_price / strike_price) + (risk_free_rate + 0.5 * volatility ** 2) * (days_to_expiration / 365)) / (volatility * math.sqrt(days_to_expiration / 365))
+        d2 = d1 - volatility * math.sqrt(days_to_expiration / 365)
+        if option_type == "call":
+            return underlying_price * normal_cdf(d1) - strike_price * math.exp(-risk_free_rate * days_to_expiration / 365) * normal_cdf(d2)
         else:
-            days = 30  # default expiration
+            return strike_price * math.exp(-risk_free_rate * days_to_expiration / 365) * normal_cdf(-d2) - underlying_price * normal_cdf(-d1)
 
-        return symbol, price, strike, days, option_type
-    return None, None, None, None, None
+    def normal_cdf(x):
+        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-# Estimate implied volatility (stub: return fixed value for now)
-def get_iv(symbol):
-    return 0.55  # example implied volatility
+    def fetch_price(symbol):
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m"
+        response = requests.get(url)
+        data = response.json()
+        return data["chart"]["result"][0]["meta"]["regularMarketPrice"]
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    symbol, price, strike, days, option_type = parse_message(text)
+    async def option(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            text = update.message.text.lower()
+            if "call" in text or "put" in text:
+                option_type = "call" if "call" in text else "put"
+                text = text.replace(option_type, "").strip()
 
-    if symbol and strike and days and option_type:
-        current_price = get_stock_price(symbol) if not price else price
-        if not current_price:
-            await update.message.reply_text("❌ 获取股价失败，请检查股票代码")
-            return
+                parts = text.split(" ")
+                target_price = float(parts[0].replace("涨到", "").replace("跌到", ""))
+                strike_price = float(parts[1].replace("行权价", "").replace("的", ""))
+                days = 30
+                for i, part in enumerate(parts):
+                    if part.startswith("exp"):
+                        if "day" in part:
+                            days = int(part.replace("exp", "").replace("days", "").strip())
+                        elif "week" in part:
+                            days = int(part.replace("exp", "").replace("weeks", "").strip()) * 7
+                        elif "month" in part:
+                            days = int(part.replace("exp", "").replace("months", "").strip()) * 30
 
-        r = 0.05  # risk-free rate
-        T = days / 365
-        sigma = get_iv(symbol)
+                symbol = "SOXL"
+                if "tsla" in text: symbol = "TSLA"
+                elif "nvda" in text: symbol = "NVDA"
+                elif "amd" in text: symbol = "AMD"
+                elif "msft" in text: symbol = "MSFT"
+                elif "baba" in text: symbol = "BABA"
 
-        option_price = black_scholes_price(current_price, strike, T, r, sigma, option_type)
-        await update.message.reply_text(
-            f"📈 If price = {current_price}, strike = {strike}, {option_type.upper()} = ${option_price} (exp in {days} days)"
-        )
-    else:
-        await update.message.reply_text("请发送格式类似的消息：\nSOXL price 25.5, strike 22, exp 3 weeks, put value?")
+                current_price = fetch_price(symbol)
+                iv = 0.6
+                price = get_option_price(current_price, strike_price, days, iv, option_type)
 
-def main():
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise ValueError("Missing TELEGRAM_TOKEN env variable")
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=(
+                    f"{symbol} 当前价：{current_price:.2f}\n"
+                    f"期权类型：{option_type.upper()}\n"
+                    f"行权价：{strike_price}\n"
+                    f"剩余天数：{days}\n"
+                    f"估算价格：${price:.2f}"
+                ))
+            else:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text="请输入格式如：SOXL 涨到25 行权价23 的 call value")
+        except Exception as e:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"错误：{e}")
 
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    if __name__ == '__main__':
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("option", option))
+        app.run_polling()
 
-if __name__ == "__main__":
-    main()
+except Exception as e:
+    print("❌ ERROR on startup:", e)
+    traceback.print_exc()
